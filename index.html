@@ -1,0 +1,531 @@
+<!DOCTYPE html>
+<html lang="uk">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Офлайн-Карти</title>
+    <style>
+        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; margin: 0; padding: 0; height: 100vh; display: flex; flex-direction: column; }
+        
+        /* UI CONTROLS */
+        #controls { 
+            padding: 15px; background: #222; color: white; 
+            display: flex; gap: 15px; align-items: center; 
+            box-shadow: 0 2px 10px rgba(0,0,0,0.3); z-index: 2000;
+        }
+        .group { display: flex; align-items: center; gap: 8px; border-right: 1px solid #555; padding-right: 15px; }
+        .group:last-child { border-right: none; }
+        
+        h1 { font-size: 18px; margin: 0; color: #fff; }
+        
+        button { 
+            padding: 8px 16px; cursor: pointer; font-weight: bold; border-radius: 4px; border: none; 
+            transition: background 0.2s;
+        }
+        #btn-download { background: #007bff; color: white; }
+        #btn-download:hover { background: #0056b3; }
+        #btn-download:disabled { background: #555; cursor: not-allowed; }
+
+        /* New Location Button Style */
+        #btn-loc { background: #17a2b8; color: white; }
+        #btn-loc:hover { background: #138496; }
+        
+        /* New Image Map Styles */
+        #btn-img-upload { background: #6f42c1; color: white; }
+        #btn-img-upload:hover { background: #59359a; }
+        
+        #btn-img-close { background: #e83e8c; color: white; display: none; }
+        #btn-img-close:hover { background: #d63384; }
+
+        #btn-clear { background: #dc3545; color: white; font-size: 12px; padding: 5px 10px;}
+        
+        /* SWITCH TOGGLE */
+        .switch-container { display: flex; align-items: center; gap: 10px; background: #444; padding: 5px 10px; border-radius: 20px; }
+        .switch-label { font-size: 14px; font-weight: bold; }
+        .toggle-checkbox { height: 0; width: 0; visibility: hidden; position: absolute; }
+        .toggle-label {
+            cursor: pointer; text-indent: -9999px; width: 40px; height: 20px; background: grey; display: block;
+            border-radius: 100px; position: relative;
+        }
+        .toggle-label:after {
+            content: ''; position: absolute; top: 2px; left: 2px; width: 16px; height: 16px; background: #fff; border-radius: 90px; transition: 0.3s;
+        }
+        .toggle-checkbox:checked + .toggle-label { background: #28a745; }
+        .toggle-checkbox:checked + .toggle-label:after { left: calc(100% - 2px); transform: translateX(-100%); }
+
+        /* STATUS BAR */
+        #status-bar { background: #f8f9fa; border-bottom: 1px solid #ddd; padding: 5px 15px; font-size: 12px; color: #333; font-family: monospace; }
+
+        /* MAP AREA */
+        #map { flex-grow: 1; background: #e5e3df; }
+
+        /* --- NEW VISUAL STYLE FOR DOWNLOADED TILES --- */
+        .cached-tile {
+            /* Green border inside the tile */
+            outline: 2px solid rgba(40, 167, 69, 0.6);
+            outline-offset: -2px;
+            /* Subtle green tint to distinguish from online tiles */
+            filter: sepia(0.2) hue-rotate(80deg);
+        }
+    </style>
+</head>
+<body>
+
+<!-- CONTROLS -->
+<div id="controls">
+    <div class="group">
+        <h1>Офлайн-Карта</h1>
+    </div>
+
+    <!-- MODE SWITCH -->
+    <div class="group">
+        <div class="switch-container">
+            <span class="switch-label">ОНЛАЙН</span>
+            <input type="checkbox" id="mode-toggle" class="toggle-checkbox" onchange="toggleMode()">
+            <label for="mode-toggle" class="toggle-label">Toggle</label>
+            <span class="switch-label">ТІЛЬКИ ОФЛАЙН</span>
+        </div>
+    </div>
+
+    <!-- IMAGE MAP MODE (NEW) -->
+    <div class="group">
+        <input type="file" id="img-input" accept="image/*" style="display: none;" onchange="handleImageUpload(this)">
+        <button id="btn-img-upload" onclick="document.getElementById('img-input').click()">🖼️ Завантажити фото-карту</button>
+        <button id="btn-img-close" onclick="closeImageMap()">✕ Закрити фото</button>
+    </div>
+
+    <!-- ACTIONS -->
+    <div class="group">
+        <button id="btn-loc" onclick="checkLocation()">📍 Моя локація</button>
+        <button id="btn-download" onclick="startDownload()">Завантажити зону (Всі зуми)</button>
+    </div>
+
+    <div class="group" style="margin-left: auto;">
+        <button id="btn-clear" onclick="clearData()">Очистити</button>
+    </div>
+</div>
+
+<div id="status-bar">Запуск системи...</div>
+<div id="map"></div>
+
+<!-- ======================================================= -->
+<!-- LOGIC START -->
+<!-- ======================================================= -->
+<script>
+    // --- CONFIGURATION ---
+    const CDN_CSS = 'https://unpkg.com/leaflet@1.9.4/dist/leaflet.css';
+    const CDN_JS = 'https://unpkg.com/leaflet@1.9.4/dist/leaflet.js';
+    
+    // Global State
+    let map = null;
+    let db = null;
+    let isOfflineOnly = false;
+    let tileLayer = null;
+    
+    // Custom Image Tiling State
+    let customMapImage = null; // The raw image object
+    let customMapBounds = null; // The bounds where the image sits
+    let isCustomImageMode = false;
+
+    // --- 1. BOOTSTRAPPER (Load JS/CSS from Cache or Net) ---
+    async function boot() {
+        updateStatus("Перевірка кешу бібліотек...");
+        
+        let css = localStorage.getItem('lib_css');
+        let js = localStorage.getItem('lib_js');
+
+        if (!css || !js) {
+            updateStatus("Завантаження бібліотек (Потрібен Інтернет)...");
+            try {
+                const [cssRes, jsRes] = await Promise.all([fetch(CDN_CSS), fetch(CDN_JS)]);
+                css = await cssRes.text();
+                js = await jsRes.text();
+                // Save to LS
+                localStorage.setItem('lib_css', css);
+                localStorage.setItem('lib_js', js);
+                updateStatus("Бібліотеки збережено.");
+            } catch (e) {
+                updateStatus("ПОМИЛКА: Не вдалося завантажити бібліотеки.");
+                return;
+            }
+        }
+
+        // Inject CSS
+        const styleTag = document.createElement('style');
+        styleTag.textContent = css;
+        document.head.appendChild(styleTag);
+
+        // Inject JS
+        const scriptTag = document.createElement('script');
+        scriptTag.textContent = js;
+        document.body.appendChild(scriptTag);
+
+        // Wait for Leaflet to parse
+        setTimeout(initApp, 200);
+    }
+
+    // --- 2. INIT APP (Database & Map) ---
+    function initApp() {
+        if (typeof L === 'undefined') return setTimeout(initApp, 100);
+        
+        updateStatus("Відкриття бази даних...");
+        
+        // Version 10 used to handle previous version conflict
+        const request = indexedDB.open("StrictOfflineDB", 10);
+        
+        request.onupgradeneeded = (e) => {
+            db = e.target.result;
+            if (!db.objectStoreNames.contains("tiles")) {
+                db.createObjectStore("tiles", { keyPath: "key" });
+            }
+        };
+
+        request.onsuccess = (e) => {
+            db = e.target.result;
+            updateStatus("Готово. Онлайн. (Збережені тайли — зелені)");
+            initMap();
+        };
+
+        request.onerror = (e) => updateStatus("Помилка БД: " + e.target.error);
+    }
+
+    function initMap() {
+        // --- START AT KYIV ---
+        map = L.map('map').setView([50.4501, 30.5234], 13);
+
+        // Define our Custom Tile Layer Class
+        L.TileLayer.Smart = L.TileLayer.extend({
+            createTile: function(coords, done) {
+                const tile = document.createElement('img');
+                const key = `${coords.z}_${coords.x}_${coords.y}`;
+
+                L.DomEvent.on(tile, 'load', L.Util.bind(this._tileOnLoad, this, done, tile));
+                L.DomEvent.on(tile, 'error', L.Util.bind(this._tileOnError, this, done, tile));
+
+                if (this.options.crossOrigin) tile.crossOrigin = '';
+                tile.alt = '';
+                tile.setAttribute('role', 'presentation');
+
+                // --- LOGIC FOR CUSTOM IMAGE TILING ---
+                if (isCustomImageMode && customMapImage && customMapBounds) {
+                    // Try to generate tile from the custom image first
+                    const tileUrl = getTileFromCustomImage(coords);
+                    if (tileUrl) {
+                        tile.src = tileUrl;
+                        // We mark this as "cached" style so user knows it's local
+                        tile.classList.add('cached-tile'); 
+                        return tile;
+                    }
+                    // If tile is outside the image bounds, fall through to normal logic
+                    // (Or remain blank if offline)
+                }
+
+                // --- NORMAL OFFLINE/ONLINE LOGIC ---
+                // A. Check Database First
+                const tx = db.transaction("tiles", "readonly");
+                const store = tx.objectStore("tiles");
+                const req = store.get(key);
+
+                req.onsuccess = (e) => {
+                    const result = e.target.result;
+                    if (result && result.blob) {
+                        // HIT: Found in DB
+                        tile.src = URL.createObjectURL(result.blob);
+                        tile.classList.add('cached-tile'); 
+                    } else {
+                        // MISS: Not in DB
+                        if (isOfflineOnly) {
+                            tile.src = "data:image/svg+xml;base64," + btoa('<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256"><rect width="256" height="256" fill="#f0f0f0"/><path d="M0 0l256 256M256 0l-256 256" stroke="#e0e0e0" stroke-width="2"/><text x="128" y="128" font-family="Arial" font-size="20" fill="#999" text-anchor="middle">ОФЛАЙН</text></svg>');
+                        } else {
+                            tile.src = `https://tile.openstreetmap.org/${coords.z}/${coords.x}/${coords.y}.png`;
+                        }
+                    }
+                };
+                
+                req.onerror = () => {
+                     if(!isOfflineOnly) tile.src = `https://tile.openstreetmap.org/${coords.z}/${coords.x}/${coords.y}.png`;
+                };
+
+                return tile;
+            }
+        });
+
+        tileLayer = new L.TileLayer.Smart(null, { maxZoom: 18 }).addTo(map);
+    }
+
+    // --- NEW: VIRTUAL TILING LOGIC ---
+    function getTileFromCustomImage(coords) {
+        // 1. Calculate the tile's geographic bounds
+        const tileBounds = tileLayer._tileCoordsToBounds(coords);
+        
+        // 2. Check if this tile intersects with our custom image bounds
+        if (!customMapBounds.intersects(tileBounds)) {
+            return null; // This tile is outside our map image
+        }
+
+        // 3. Coordinate Math: Map the Tile grid to the Image Pixels
+        const z = coords.z;
+        
+        // Get the pixel coordinates of the TopLeft and BottomRight of the *entire* custom image at this zoom level
+        const imgNwPoint = map.project(customMapBounds.getNorthWest(), z);
+        const imgSePoint = map.project(customMapBounds.getSouthEast(), z);
+        
+        // Get the pixel coordinates of the TopLeft of the *requested tile*
+        const tileNwPoint = L.point(coords.x * 256, coords.y * 256);
+        
+        // 4. Calculate where to slice
+        const projImgWidth = imgSePoint.x - imgNwPoint.x;
+        const projImgHeight = imgSePoint.y - imgNwPoint.y;
+        
+        const relativeX = tileNwPoint.x - imgNwPoint.x;
+        const relativeY = tileNwPoint.y - imgNwPoint.y;
+        
+        // 5. Create a Canvas to draw the slice
+        const canvas = document.createElement('canvas');
+        canvas.width = 256;
+        canvas.height = 256;
+        const ctx = canvas.getContext('2d');
+        
+        // 6. Draw logic
+        const scaleX = customMapImage.naturalWidth / projImgWidth;
+        const scaleY = customMapImage.naturalHeight / projImgHeight;
+        
+        const sx = relativeX * scaleX;
+        const sy = relativeY * scaleY;
+        const sWidth = 256 * scaleX;
+        const sHeight = 256 * scaleY;
+        
+        try {
+            // Because we calculated bounds based on aspect ratio, scaleX should approx equal scaleY
+            // preventing distortion.
+            ctx.drawImage(customMapImage, sx, sy, sWidth, sHeight, 0, 0, 256, 256);
+            return canvas.toDataURL('image/png');
+        } catch(e) {
+            console.error("Tile generation error", e);
+            return null;
+        }
+    }
+
+    // --- 3. UI ACTIONS ---
+
+    function toggleMode() {
+        const checkbox = document.getElementById('mode-toggle');
+        isOfflineOnly = checkbox.checked;
+        
+        if (isOfflineOnly) {
+            updateStatus("РЕЖИМ ОФЛАЙН. Мережу вимкнено.");
+            document.getElementById('btn-download').disabled = true;
+            document.body.style.backgroundColor = "#e0e0e0";
+        } else {
+            updateStatus("РЕЖИМ ОНЛАЙН.");
+            document.getElementById('btn-download').disabled = false;
+            document.body.style.backgroundColor = "#fff";
+        }
+        
+        tileLayer.redraw();
+    }
+
+    // --- NEW: IMAGE MAP LOGIC (Modified to Preserve Aspect Ratio) ---
+    function handleImageUpload(input) {
+        if (input.files && input.files[0]) {
+            const reader = new FileReader();
+            
+            reader.onload = function(e) {
+                const img = new Image();
+                img.onload = function() {
+                    customMapImage = img;
+                    
+                    // --- CALCULATE BOUNDS TO PRESERVE ASPECT RATIO ---
+                    // 1. Get current map state
+                    const center = map.getCenter();
+                    const zoom = map.getZoom();
+                    const mapSize = map.getSize(); // Viewport size in pixels
+                    
+                    // 2. Get Image Dimensions
+                    const imgW = img.naturalWidth;
+                    const imgH = img.naturalHeight;
+                    
+                    // 3. Determine Scale to "Contain" image within current Viewport
+                    // (We use 90% of screen size to leave a small margin)
+                    const scale = Math.min(mapSize.x / imgW, mapSize.y / imgH) * 0.9;
+                    
+                    const destW = imgW * scale;
+                    const destH = imgH * scale;
+                    
+                    // 4. Calculate pixel coordinates centered on the map
+                    const centerPoint = map.project(center, zoom);
+                    const halfW = destW / 2;
+                    const halfH = destH / 2;
+                    
+                    const nwPoint = L.point(centerPoint.x - halfW, centerPoint.y - halfH);
+                    const sePoint = L.point(centerPoint.x + halfW, centerPoint.y + halfH);
+                    
+                    // 5. Convert pixel corners back to geographic LatLng bounds
+                    const nwLatLng = map.unproject(nwPoint, zoom);
+                    const seLatLng = map.unproject(sePoint, zoom);
+                    
+                    customMapBounds = L.latLngBounds(nwLatLng, seLatLng);
+                    isCustomImageMode = true;
+
+                    // --- UI UPDATES ---
+                    document.getElementById('btn-img-upload').style.display = 'none';
+                    document.getElementById('btn-img-close').style.display = 'inline-block';
+                    updateStatus(`Фото завантажено! Пропорції: ${imgW}x${imgH}. Наблизьте для деталей.`);
+
+                    // Trigger Offline Mode
+                    const modeCheckbox = document.getElementById('mode-toggle');
+                    if (!modeCheckbox.checked) {
+                        modeCheckbox.checked = true;
+                        toggleMode();
+                    } else {
+                        tileLayer.redraw();
+                    }
+                };
+                img.src = e.target.result;
+            }
+
+            reader.readAsDataURL(input.files[0]);
+        }
+    }
+
+    function closeImageMap() {
+        isCustomImageMode = false;
+        customMapImage = null;
+        customMapBounds = null;
+        
+        // Reset file input
+        document.getElementById('img-input').value = "";
+        
+        // Reset UI buttons
+        document.getElementById('btn-img-upload').style.display = 'inline-block';
+        document.getElementById('btn-img-close').style.display = 'none';
+        
+        tileLayer.redraw();
+        updateStatus("Фото прибрано. Стандартна карта.");
+    }
+    // ----------------------------
+
+    function checkLocation() {
+        if (!navigator.geolocation) {
+            alert("Геолокація не підтримується браузером.");
+            return;
+        }
+
+        updateStatus("Пошук...");
+
+        navigator.geolocation.getCurrentPosition(
+            (position) => {
+                const lat = position.coords.latitude;
+                const lng = position.coords.longitude;
+                
+                // Fly to location
+                map.setView([lat, lng], 15);
+                
+                // Show Popup ONLY (No Marker)
+                L.popup()
+                    .setLatLng([lat, lng])
+                    .setContent("Ви тут")
+                    .openOn(map);
+                
+                updateStatus(`Знайдено: ${lat.toFixed(4)}, ${lng.toFixed(4)}`);
+            },
+            () => {
+                updateStatus("Помилка: Неможливо отримати локацію.");
+                alert("Не вдалося визначити місцезнаходження.");
+            }
+        );
+    }
+
+    async function startDownload() {
+        const btn = document.getElementById('btn-download');
+        btn.disabled = true;
+        
+        const bounds = map.getBounds();
+        
+        // Define Range: From World View (0) to Max Detail (18)
+        const minZ = 0;
+        const maxZ = 18; 
+
+        const minLat = bounds.getSouth();
+        const maxLat = bounds.getNorth();
+        const minLng = bounds.getWest();
+        const maxLng = bounds.getEast();
+
+        // 1. Build List of Tiles to Download (All Zoom Levels for current area)
+        let queue = [];
+        
+        for (let z = minZ; z <= maxZ; z++) {
+             const top_y = lat2tile(maxLat, z);
+             const bottom_y = lat2tile(minLat, z);
+             const left_x = long2tile(minLng, z);
+             const right_x = long2tile(maxLng, z);
+
+             for (let x = left_x; x <= right_x; x++) {
+                 for (let y = top_y; y <= bottom_y; y++) {
+                     queue.push({z: z, x: x, y: y});
+                 }
+             }
+        }
+
+        const total = queue.length;
+        
+        // Increased safety limit to 5000 because "All Zooms" creates many tiles
+        if(total > 5000) {
+            alert(`Завелика область (${total} тайлів). Наблизьте карту.`);
+            btn.disabled = false;
+            return;
+        }
+
+        let saved = 0;
+        let errors = 0;
+
+        // 2. Process Queue
+        for (let i = 0; i < total; i++) {
+            const item = queue[i];
+            updateStatus(`Завантаження ${saved + 1}/${total} (Зум ${item.z})...`);
+            
+            const key = `${item.z}_${item.x}_${item.y}`;
+            const url = `https://tile.openstreetmap.org/${item.z}/${item.x}/${item.y}.png`;
+
+            try {
+                const resp = await fetch(url);
+                if(resp.ok) {
+                    const blob = await resp.blob();
+                    const tx = db.transaction("tiles", "readwrite");
+                    tx.objectStore("tiles").put({ key: key, blob: blob });
+                } else { errors++; }
+            } catch(e) { errors++; }
+            
+            saved++;
+            // Polite delay
+            await new Promise(r => setTimeout(r, 20));
+        }
+
+        updateStatus(`Готово! Збережено ${saved} тайлів (Зум ${minZ}-${maxZ}).`);
+        btn.disabled = false;
+        tileLayer.redraw();
+    }
+
+    function clearData() {
+        if(!confirm("Ви впевнені? Це видалить всі збережені карти.")) return;
+        const tx = db.transaction("tiles", "readwrite");
+        tx.objectStore("tiles").clear();
+        updateStatus("Базу очищено.");
+        tileLayer.redraw();
+    }
+
+    function updateStatus(msg) {
+        document.getElementById('status-bar').innerText = msg;
+        console.log(msg);
+    }
+
+    // --- HELPERS ---
+    function long2tile(lon,zoom) { return (Math.floor((lon+180)/360*Math.pow(2,zoom))); }
+    function lat2tile(lat,zoom)  { return (Math.floor((1-Math.log(Math.tan(lat*Math.PI/180) + 1/Math.cos(lat*Math.PI/180))/Math.PI)/2 *Math.pow(2,zoom))); }
+
+    // Start
+    boot();
+
+</script>
+</body>
+</html>
