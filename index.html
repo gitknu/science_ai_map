@@ -225,7 +225,8 @@
         
         updateStatus("Відкриття бази даних...");
         
-        const request = indexedDB.open("StrictOfflineDB", 14);
+        // Increased DB version to 15 to add road network stores
+        const request = indexedDB.open("StrictOfflineDB", 15);
         
         request.onupgradeneeded = (e) => {
             db = e.target.result;
@@ -237,6 +238,13 @@
             }
             if (!db.objectStoreNames.contains("routes_cache")) {
                 db.createObjectStore("routes_cache", { keyPath: "key" });
+            }
+            // New stores for Offline Routing
+            if (!db.objectStoreNames.contains("road_nodes")) {
+                db.createObjectStore("road_nodes", { keyPath: "id" });
+            }
+            if (!db.objectStoreNames.contains("road_ways")) {
+                db.createObjectStore("road_ways", { keyPath: "id" });
             }
         };
 
@@ -301,24 +309,18 @@
 
     // --- AUTO OFFLINE MONITOR ---
     function initAutoOfflineProtection() {
-        // Check connection every 5 seconds
         setInterval(async () => {
-            // If already in offline mode, do nothing
             if (isOfflineOnly) {
                 noConnectionStart = 0;
                 return;
             }
 
-            // Perform a robust connectivity check
             let isConnected = navigator.onLine;
 
             if (isConnected) {
                 try {
-                    // Try to fetch a tiny resource (OSM tile) with a short timeout to confirm real internet
                     const controller = new AbortController();
-                    const timeoutId = setTimeout(() => controller.abort(), 2000); // 2s timeout
-                    
-                    // We use cache: 'no-store' to ensure we test the network, not the disk cache
+                    const timeoutId = setTimeout(() => controller.abort(), 2000);
                     await fetch('https://tile.openstreetmap.org/0/0/0.png', { 
                         method: 'HEAD', 
                         signal: controller.signal,
@@ -338,20 +340,18 @@
                     const downtime = Date.now() - noConnectionStart;
                     const remaining = Math.ceil((15000 - downtime) / 1000);
                     
-                    if (downtime > 15000) { // 30 seconds
+                    if (downtime > 15000) {
                         updateStatus("⚠️ Зв'язок втрачено на 15 секунд. Увімкнено режим оффлайн!");
                         const checkbox = document.getElementById('mode-toggle');
                         checkbox.checked = true;
-                        toggleMode(); // Switch to offline
-                        noConnectionStart = 0; // Reset
+                        toggleMode();
+                        noConnectionStart = 0;
                         alert("⚠️ Інтернет відсутній більше 15 секунд. Увімкнено режим оффлайн!");
                     } else if (downtime > 5000) {
-                        // Warn in console or status bar
                         console.log(`Connection unstable. Switching to offline in ${remaining}s`);
                     }
                 }
             } else {
-                // Connection is good
                 if (noConnectionStart !== 0) {
                     console.log("Connection restored.");
                     noConnectionStart = 0;
@@ -374,7 +374,7 @@
         return matrix[b.length][a.length];
     }
 
-    // --- SEARCH & AUTOCOMPLETE (PRIORITIZED) ---
+    // --- SEARCH & AUTOCOMPLETE ---
     function handleSearchInput(input) {
         const val = input.value.trim().toLowerCase();
         const list = document.getElementById('search-suggestions');
@@ -393,12 +393,9 @@
 
             req.onsuccess = (e) => {
                 const allItems = e.target.result;
-                
-                // Scoring
                 const scored = allItems.map(item => {
                     const text = item.query; 
                     let score = 0;
-                    
                     if (text.startsWith(val)) score = 100;
                     else if (text.includes(" " + val)) score = 80;
                     else if (text.includes(val)) score = 60;
@@ -408,8 +405,7 @@
                             if (dist <= 2) score = 30 - dist; 
                         }
                     }
-
-                    if (score > 0) score -= (text.length - val.length) * 0.05; // Penalize length
+                    if (score > 0) score -= (text.length - val.length) * 0.05;
                     return { item, score };
                 });
 
@@ -451,7 +447,6 @@
     function doSearch() {
         const query = document.getElementById('search-input').value.trim().toLowerCase();
         if(!query) return;
-        
         document.getElementById('search-suggestions').style.display = 'none';
         updateStatus(`Шукаю "${query}"...`);
 
@@ -479,7 +474,6 @@
             const url = `https://nominatim.openstreetmap.org/search?format=json&q=${encodeURIComponent(query)}`;
             const resp = await fetch(url);
             const data = await resp.json();
-
             if (data && data.length > 0) {
                 const best = data[0];
                 const lat = parseFloat(best.lat);
@@ -532,16 +526,171 @@
 
     async function calculateRoute(start, end) {
         const key = `${start.lat.toFixed(3)},${start.lng.toFixed(3)}_${end.lat.toFixed(3)},${end.lng.toFixed(3)}`;
+        
+        // 1. Try Cached Route
         const tx = db.transaction("routes_cache", "readonly");
-        const store = tx.objectStore("routes_cache");
-        const req = store.get(key);
+        const req = tx.objectStore("routes_cache").get(key);
+        
         req.onsuccess = async (e) => {
-            if (e.target.result) drawRoute(e.target.result.geometry, "Офлайн (з кешу)");
-            else {
-                if (isOfflineOnly) alert("Маршрут не знайдено в пам'яті.");
-                else await fetchRouteOnline(start, end, key);
+            if (e.target.result) {
+                drawRoute(e.target.result.geometry, "Офлайн (з кешу)");
+            } else {
+                // 2. Try Online or Local Offline Calculation
+                if (isOfflineOnly) {
+                    updateStatus("Запуск локального розрахунку маршруту...");
+                    try {
+                        await calculateOfflineRoute(start, end);
+                    } catch (err) {
+                        alert("Не вдалося прокласти маршрут локально: " + err.message);
+                    }
+                } else {
+                    await fetchRouteOnline(start, end, key);
+                }
             }
         };
+    }
+
+    // --- LOCAL OFFLINE ROUTING (A* Algorithm) ---
+    async function calculateOfflineRoute(start, end) {
+        updateStatus("Завантаження дорожньої мережі з БД...");
+        
+        // 1. Fetch data from IndexedDB
+        const nodes = await getAllFromStore('road_nodes');
+        const ways = await getAllFromStore('road_ways');
+        
+        if (nodes.length === 0 || ways.length === 0) {
+            throw new Error("Немає даних доріг. Спочатку завантажте зону (кнопка ⬇️ Зона).");
+        }
+
+        updateStatus("Побудова графа...");
+        
+        // 2. Build Adjacency Graph
+        const graph = {}; 
+        // Helper to add edge
+        const addEdge = (u, v) => {
+            if (!graph[u]) graph[u] = [];
+            if (!graph[v]) graph[v] = [];
+            const dist = getDist(nodes.find(n=>n.id==u), nodes.find(n=>n.id==v));
+            graph[u].push({ node: v, cost: dist });
+            graph[v].push({ node: u, cost: dist }); // Undirected for simplicity
+        };
+
+        for (const way of ways) {
+            for (let i = 0; i < way.nodes.length - 1; i++) {
+                const u = way.nodes[i];
+                const v = way.nodes[i+1];
+                // Check if both nodes exist in our bbox
+                if (nodes.find(n=>n.id==u) && nodes.find(n=>n.id==v)) {
+                    addEdge(u, v);
+                }
+            }
+        }
+
+        // 3. Find Nearest Start/End Nodes
+        const startNode = findNearestNode(start, nodes);
+        const endNode = findNearestNode(end, nodes);
+
+        if (!startNode || !endNode) throw new Error("Точки надто далеко від відомих доріг.");
+        if (startNode.id === endNode.id) throw new Error("Точки збігаються.");
+
+        updateStatus("Пошук шляху (A*)...");
+
+        // 4. A* Algorithm
+        const openSet = new Set([startNode.id]);
+        const cameFrom = {};
+        const gScore = { [startNode.id]: 0 };
+        const fScore = { [startNode.id]: getDist(startNode, endNode) };
+
+        // Simple Priority Queue implementation using Array sort (good enough for <10k nodes)
+        const getLowestF = () => {
+            let lowNode = null;
+            let lowScore = Infinity;
+            for (const id of openSet) {
+                const score = fScore[id] !== undefined ? fScore[id] : Infinity;
+                if (score < lowScore) {
+                    lowScore = score;
+                    lowNode = id;
+                }
+            }
+            return lowNode;
+        };
+
+        let iterations = 0;
+        while (openSet.size > 0) {
+            iterations++;
+            if (iterations > 50000) throw new Error("Маршрут занадто складний/довгий.");
+
+            const current = getLowestF();
+            if (current == endNode.id) {
+                // Reconstruct Path
+                const path = [current];
+                let temp = current;
+                while (cameFrom[temp]) {
+                    temp = cameFrom[temp];
+                    path.unshift(temp);
+                }
+                
+                // Convert Node IDs to LatLngs
+                const latlngs = path.map(id => {
+                    const n = nodes.find(x => x.id == id);
+                    return [n.lat, n.lon];
+                });
+                
+                drawRoute(latlngs, "Офлайн (Локально)");
+                return;
+            }
+
+            openSet.delete(current);
+            const neighbors = graph[current] || [];
+
+            for (const neighbor of neighbors) {
+                const tentativeG = gScore[current] + neighbor.cost;
+                if (tentativeG < (gScore[neighbor.node] || Infinity)) {
+                    cameFrom[neighbor.node] = current;
+                    gScore[neighbor.node] = tentativeG;
+                    const neighborObj = nodes.find(n => n.id == neighbor.node);
+                    fScore[neighbor.node] = tentativeG + getDist(neighborObj, endNode);
+                    if (!openSet.has(neighbor.node)) {
+                        openSet.add(neighbor.node);
+                    }
+                }
+            }
+        }
+
+        throw new Error("Шлях не знайдено (немає з'єднання).");
+    }
+
+    // Helper: Haversine Distance
+    function getDist(n1, n2) {
+        const R = 6371e3; // metres
+        const φ1 = n1.lat * Math.PI/180;
+        const φ2 = n2.lat * Math.PI/180;
+        const Δφ = (n2.lat-n1.lat) * Math.PI/180;
+        const Δλ = (n2.lon-n1.lon) * Math.PI/180;
+        const a = Math.sin(Δφ/2) * Math.sin(Δφ/2) +
+                  Math.cos(φ1) * Math.cos(φ2) *
+                  Math.sin(Δλ/2) * Math.sin(Δλ/2);
+        const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
+        return R * c;
+    }
+
+    function findNearestNode(target, nodes) {
+        let minD = Infinity;
+        let best = null;
+        for (const n of nodes) {
+            const d = (n.lat-target.lat)**2 + (n.lon-target.lng)**2;
+            if (d < minD) { minD = d; best = n; }
+        }
+        return best;
+    }
+
+    function getAllFromStore(storeName) {
+        return new Promise((resolve, reject) => {
+            const tx = db.transaction(storeName, "readonly");
+            const req = tx.objectStore(storeName).getAll();
+            req.onsuccess = () => resolve(req.result);
+            req.onerror = () => reject(req.error);
+        });
     }
 
     async function fetchRouteOnline(start, end, key) {
@@ -556,8 +705,14 @@
                 drawRoute(geo, `${dist} км`);
                 const tx = db.transaction("routes_cache", "readwrite");
                 tx.objectStore("routes_cache").put({ key: key, geometry: geo, distance: dist });
-            } else alert("Маршрут не знайдено.");
-        } catch (e) { updateStatus("Помилка маршруту: " + e.message); }
+            } else {
+                // Fallback to local if online fails
+                 calculateOfflineRoute(start, end).catch(e => alert("Маршрут не знайдено ні онлайн, ні офлайн."));
+            }
+        } catch (e) { 
+            updateStatus("Помилка онлайн, пробую локально...");
+            calculateOfflineRoute(start, end).catch(err => updateStatus("Помилка маршруту: " + err.message));
+        }
     }
 
     function drawRoute(latlngs, label) {
@@ -591,7 +746,6 @@
         document.body.style.backgroundColor = isOfflineOnly ? "#e0e0e0" : "#fff";
         document.getElementById('btn-download').disabled = isOfflineOnly;
         
-        // If user manually toggles, reset the auto-switch timer so it doesn't immediately flip back
         noConnectionStart = 0;
         
         tileLayer.redraw();
@@ -639,7 +793,56 @@
         );
     }
 
-    // --- ROBUST METADATA DOWNLOADER ---
+    // --- DATA DOWNLOADER (Tiles + Names + ROADS) ---
+    async function downloadRoadData(bounds) {
+        updateStatus("Завантаження дорожньої сітки для офлайн-навігації...");
+        const s = bounds.getSouth();
+        const w = bounds.getWest();
+        const n = bounds.getNorth();
+        const e = bounds.getEast();
+
+        // Overpass QL: get ways with 'highway' tag and recursively get their nodes
+        const query = `
+            [out:json][timeout:90];
+            (
+              way["highway"](${s},${w},${n},${e});
+            );
+            (._;>;);
+            out body;
+        `;
+        const url = `https://overpass-api.de/api/interpreter?data=${encodeURIComponent(query)}`;
+
+        try {
+            const resp = await fetch(url);
+            if (!resp.ok) throw new Error("Overpass API Error");
+            const data = await resp.json();
+
+            const tx = db.transaction(["road_nodes", "road_ways"], "readwrite");
+            const nStore = tx.objectStore("road_nodes");
+            const wStore = tx.objectStore("road_ways");
+
+            let nodeCount = 0;
+            let wayCount = 0;
+
+            for (const el of data.elements) {
+                if (el.type === 'node') {
+                    nStore.put({ id: el.id, lat: el.lat, lon: el.lon });
+                    nodeCount++;
+                } else if (el.type === 'way') {
+                    if (el.nodes && el.nodes.length > 1) {
+                        wStore.put({ id: el.id, nodes: el.nodes });
+                        wayCount++;
+                    }
+                }
+            }
+            console.log(`Saved ${nodeCount} nodes and ${wayCount} ways.`);
+            return true;
+        } catch (e) {
+            console.error(e);
+            return false;
+        }
+    }
+
     async function downloadPlacesMetadata(bounds) {
         updateStatus("Індексація ВСІХ назв (це може зайняти хвилину)...");
         const s = bounds.getSouth() - 0.005;
@@ -694,10 +897,8 @@
                 });
                 if(names.size > 0) count++;
             }
-            console.log(`Indexed ${count} objects for offline search.`);
             return count;
         } catch(e) {
-            console.warn("Metadata error:", e);
             updateStatus("Помилка завантаження назв: " + e.message);
             await new Promise(r => setTimeout(r, 2000));
             return 0;
@@ -709,9 +910,16 @@
         btn.disabled = true;
         const b = map.getBounds();
         
+        // 1. Download Place Names
         const count = await downloadPlacesMetadata(b);
-        updateStatus(`Проіндексовано ${count} об'єктів. Завантаження карти...`);
+        
+        // 2. Download Road Network for Routing
+        const roadsOk = await downloadRoadData(b);
+        const roadMsg = roadsOk ? "Дороги збережено." : "Помилка доріг.";
 
+        updateStatus(`Місця: ${count}. ${roadMsg} Завантаження тайлів...`);
+
+        // 3. Download Tiles
         const minZ = 0, maxZ = 18;
         let queue = [];
         for (let z = minZ; z <= maxZ; z++) {
@@ -744,7 +952,7 @@
                 timeStr = `~${m},${s === 0 ? '00' : '30'} хв`;
             }
 
-            updateStatus(`Завантаження карти ${saved+1}/${total} (Зум ${item.z})... Час: ${timeStr}`);
+            updateStatus(`Завантаження: ${saved+1}/${total} (Зум ${item.z})... Час: ${timeStr}`);
             
             try {
                 const r = await fetch(`https://tile.openstreetmap.org/${item.z}/${item.x}/${item.y}.png`);
@@ -758,7 +966,7 @@
         }
 
         btn.disabled = false;
-        updateStatus(`Готово! Карти та пошук (${count} місць) збережено.`);
+        updateStatus(`Готово! Карти, дороги та пошук збережено.`);
         tileLayer.redraw();
     }
 
@@ -767,6 +975,8 @@
         db.transaction("tiles", "readwrite").objectStore("tiles").clear();
         db.transaction("search_cache", "readwrite").objectStore("search_cache").clear();
         db.transaction("routes_cache", "readwrite").objectStore("routes_cache").clear();
+        db.transaction("road_nodes", "readwrite").objectStore("road_nodes").clear();
+        db.transaction("road_ways", "readwrite").objectStore("road_ways").clear();
         updateStatus("Все очищено.");
         tileLayer.redraw();
     }
