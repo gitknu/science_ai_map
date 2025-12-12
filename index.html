@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Офлайн-Карти (Smart Search)</title>
+    <title>Офлайн-Карти (Auto-Offline)</title>
     <style>
         body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; margin: 0; padding: 0; height: 100vh; display: flex; flex-direction: column; }
         
@@ -69,7 +69,6 @@
         }
         .suggestion-item:last-child { border-bottom: none; }
         .suggestion-item:hover { background-color: #f0f0f0; }
-        .match-highlight { font-weight: bold; color: #007bff; }
         
         /* SWITCH TOGGLE */
         .switch-container { display: flex; align-items: center; gap: 10px; background: #444; padding: 5px 10px; border-radius: 20px; }
@@ -166,6 +165,9 @@
     let tileLayer = null;
     let searchDebounce = null;
     
+    // Auto-Offline State
+    let noConnectionStart = 0; // Timestamp when connection was first lost
+    
     // Custom Image Tiling State
     let customMapImage = null;
     let customMapBounds = null;
@@ -212,6 +214,9 @@
                 document.getElementById('search-suggestions').style.display = 'none';
             }
         });
+        
+        // Start the auto-offline monitor
+        initAutoOfflineProtection();
     }
 
     // --- 2. INIT APP ---
@@ -220,7 +225,6 @@
         
         updateStatus("Відкриття бази даних...");
         
-        // Version 14
         const request = indexedDB.open("StrictOfflineDB", 14);
         
         request.onupgradeneeded = (e) => {
@@ -295,7 +299,68 @@
         tileLayer = new L.TileLayer.Smart(null, { maxZoom: 18 }).addTo(map);
     }
 
-    // --- LEVENSHTEIN DISTANCE (For Fuzzy Search) ---
+    // --- AUTO OFFLINE MONITOR ---
+    function initAutoOfflineProtection() {
+        // Check connection every 5 seconds
+        setInterval(async () => {
+            // If already in offline mode, do nothing
+            if (isOfflineOnly) {
+                noConnectionStart = 0;
+                return;
+            }
+
+            // Perform a robust connectivity check
+            let isConnected = navigator.onLine;
+
+            if (isConnected) {
+                try {
+                    // Try to fetch a tiny resource (OSM tile) with a short timeout to confirm real internet
+                    const controller = new AbortController();
+                    const timeoutId = setTimeout(() => controller.abort(), 2000); // 2s timeout
+                    
+                    // We use cache: 'no-store' to ensure we test the network, not the disk cache
+                    await fetch('https://tile.openstreetmap.org/0/0/0.png', { 
+                        method: 'HEAD', 
+                        signal: controller.signal,
+                        cache: 'no-store'
+                    });
+                    clearTimeout(timeoutId);
+                } catch (e) {
+                    isConnected = false;
+                }
+            }
+
+            if (!isConnected) {
+                if (noConnectionStart === 0) {
+                    noConnectionStart = Date.now();
+                    console.log("Connection lost. Timer started.");
+                } else {
+                    const downtime = Date.now() - noConnectionStart;
+                    const remaining = Math.ceil((15000 - downtime) / 1000);
+                    
+                    if (downtime > 15000) { // 30 seconds
+                        updateStatus("⚠️ Зв'язок втрачено на 15 секунд. Увімкнено режим оффлайн!");
+                        const checkbox = document.getElementById('mode-toggle');
+                        checkbox.checked = true;
+                        toggleMode(); // Switch to offline
+                        noConnectionStart = 0; // Reset
+                        alert("⚠️ Інтернет відсутній більше 15 секунд. Увімкнено режим оффлайн!");
+                    } else if (downtime > 5000) {
+                        // Warn in console or status bar
+                        console.log(`Connection unstable. Switching to offline in ${remaining}s`);
+                    }
+                }
+            } else {
+                // Connection is good
+                if (noConnectionStart !== 0) {
+                    console.log("Connection restored.");
+                    noConnectionStart = 0;
+                }
+            }
+        }, 5000);
+    }
+
+    // --- LEVENSHTEIN DISTANCE ---
     function levenshtein(a, b) {
         const matrix = [];
         for (let i = 0; i <= b.length; i++) matrix[i] = [i];
@@ -309,7 +374,7 @@
         return matrix[b.length][a.length];
     }
 
-    // --- SMART SEARCH & AUTOCOMPLETE ---
+    // --- SEARCH & AUTOCOMPLETE (PRIORITIZED) ---
     function handleSearchInput(input) {
         const val = input.value.trim().toLowerCase();
         const list = document.getElementById('search-suggestions');
@@ -324,52 +389,30 @@
         searchDebounce = setTimeout(() => {
             const tx = db.transaction("search_cache", "readonly");
             const store = tx.objectStore("search_cache");
-            
-            // To support "contains" and fuzzy, we must scan the keys. 
-            // Since user data is local, getAll() is usually fast enough for <50k items.
             const req = store.getAll();
 
             req.onsuccess = (e) => {
                 const allItems = e.target.result;
                 
-                // --- SCORING SYSTEM ---
+                // Scoring
                 const scored = allItems.map(item => {
-                    const text = item.query; // Lowercase name from DB
+                    const text = item.query; 
                     let score = 0;
                     
-                    // 1. STARTS WITH (Highest Priority)
-                    if (text.startsWith(val)) {
-                        score = 100;
-                    } 
-                    // 2. STARTS WITH WORD (High Priority)
-                    else if (text.includes(" " + val)) {
-                        score = 80;
-                    } 
-                    // 3. CONTAINS (Medium Priority)
-                    else if (text.includes(val)) {
-                        score = 60;
-                    } 
-                    // 4. FUZZY MATCH (Low Priority)
+                    if (text.startsWith(val)) score = 100;
+                    else if (text.includes(" " + val)) score = 80;
+                    else if (text.includes(val)) score = 60;
                     else {
-                        // Only check fuzzy if query is long enough to mean something
                         if (val.length > 3) {
                             const dist = levenshtein(text, val);
-                            // Allow errors relative to length (e.g. 2 chars error allowed)
-                            if (dist <= 2) {
-                                score = 30 - dist; 
-                            }
+                            if (dist <= 2) score = 30 - dist; 
                         }
                     }
 
-                    // Penalize very long strings slightly so shorter exact matches bubble up
-                    if (score > 0) {
-                        score -= (text.length - val.length) * 0.05;
-                    }
-
+                    if (score > 0) score -= (text.length - val.length) * 0.05; // Penalize length
                     return { item, score };
                 });
 
-                // Filter, Sort and Slice
                 const matches = scored
                     .filter(x => x.score > 0)
                     .sort((a, b) => b.score - a.score)
@@ -412,7 +455,6 @@
         document.getElementById('search-suggestions').style.display = 'none';
         updateStatus(`Шукаю "${query}"...`);
 
-        // Check if we have an exact match in DB logic first
         const tx = db.transaction("search_cache", "readonly");
         const store = tx.objectStore("search_cache");
         const req = store.get(query);
@@ -424,7 +466,7 @@
                 updateStatus(`Знайдено в пам'яті: ${query}`);
             } else {
                 if (isOfflineOnly) {
-                    alert(`"${query}" не знайдено. Спробуйте вибрати зі списку підказок.`);
+                    alert(`"${query}" не знайдено. Перевірте список підказок.`);
                 } else {
                     searchOnline(query);
                 }
@@ -548,6 +590,10 @@
         isOfflineOnly = document.getElementById('mode-toggle').checked;
         document.body.style.backgroundColor = isOfflineOnly ? "#e0e0e0" : "#fff";
         document.getElementById('btn-download').disabled = isOfflineOnly;
+        
+        // If user manually toggles, reset the auto-switch timer so it doesn't immediately flip back
+        noConnectionStart = 0;
+        
         tileLayer.redraw();
         updateStatus(isOfflineOnly ? "РЕЖИМ ОФЛАЙН" : "РЕЖИМ ОНЛАЙН");
     }
